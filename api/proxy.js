@@ -35,6 +35,23 @@ function toAbsolute(url, base) {
   return base + url;
 }
 
+function rewriteM3U8(body, target, workerBase) {
+  const basePath = target.substring(0, target.lastIndexOf('/') + 1);
+  return body
+    .split('\n')
+    .map(line => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('#')) {
+        return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+          return `URI="${workerBase}?url=${encodeURIComponent(toAbsolute(uri, basePath))}"`;
+        });
+      }
+      if (!trimmed) return line;
+      return `${workerBase}?url=${encodeURIComponent(toAbsolute(trimmed, basePath))}`;
+    })
+    .join('\n');
+}
+
 export default async function handler(req, res) {
   // CORS preflight
   if (req.method === 'OPTIONS') {
@@ -47,7 +64,7 @@ export default async function handler(req, res) {
 
   if (!target) {
     res.writeHead(400, corsHeaders);
-    res.end('Paramètre url manquant');
+    res.end('Parametre url manquant');
     return;
   }
 
@@ -62,7 +79,7 @@ export default async function handler(req, res) {
 
   if (!['http:', 'https:'].includes(targetUrl.protocol)) {
     res.writeHead(400, corsHeaders);
-    res.end('Schéma invalide');
+    res.end('Schema invalide');
     return;
   }
 
@@ -89,49 +106,43 @@ export default async function handler(req, res) {
   }
 
   const ct     = upstream.headers.get('content-type') || '';
-  const extRaw = target.split('?')[0].split('.').pop().toLowerCase();
+  // Extension extraite de l'URL CIBLE (pas de l'URL du worker)
+  const extRaw = targetUrl.pathname.split('.').pop().toLowerCase();
 
-  const isM3U8 = ct.includes('mpegurl') || ct.includes('x-mpegurl')
-               || extRaw === 'm3u8' || extRaw === 'm3u';
+  const workerBase = `https://${req.headers.host}/`;
 
-  if (isM3U8) {
+  // Détection M3U8 par Content-Type ou extension
+  const ctIsM3U8  = ct.includes('mpegurl') || ct.includes('x-mpegurl');
+  const extIsM3U8 = extRaw === 'm3u8' || extRaw === 'm3u';
+
+  if (ctIsM3U8 || extIsM3U8) {
     const body = await upstream.text();
-
-    if (!body.includes('#EXTM3U') && !body.includes('#EXT-X-')) {
-      res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/vnd.apple.mpegurl' });
+    const looksLikeM3U8 = body.includes('#EXTM3U') || body.includes('#EXT-X-');
+    if (!looksLikeM3U8) {
+      res.writeHead(200, { ...corsHeaders, 'Content-Type': ct || 'text/plain' });
       res.end(body);
       return;
     }
-
-    const basePath   = target.substring(0, target.lastIndexOf('/') + 1);
-    const workerBase = `https://${req.headers.host}/api/proxy`;
-
-    const rewritten = body
-      .split('\n')
-      .map(line => {
-        const trimmed = line.trim();
-
-        if (trimmed.startsWith('#')) {
-          return line.replace(/URI="([^"]+)"/g, (_, uri) => {
-            return `URI="${workerBase}?url=${encodeURIComponent(toAbsolute(uri, basePath))}"`;
-          });
-        }
-
-        if (!trimmed) return line;
-
-        return `${workerBase}?url=${encodeURIComponent(toAbsolute(trimmed, basePath))}`;
-      })
-      .join('\n');
-
+    const rewritten = rewriteM3U8(body, target, workerBase);
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/vnd.apple.mpegurl' });
     res.end(rewritten);
     return;
   }
 
-  // Binaire — stream direct
+  // Pas détecté par header/extension → peek les premiers octets
+  const buffer = await upstream.arrayBuffer();
+  const peek   = new TextDecoder().decode(buffer.slice(0, 512));
+
+  if (peek.includes('#EXTM3U') || peek.includes('#EXT-X-')) {
+    const fullText  = new TextDecoder().decode(buffer);
+    const rewritten = rewriteM3U8(fullText, target, workerBase);
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/vnd.apple.mpegurl' });
+    res.end(rewritten);
+    return;
+  }
+
+  // Vraie ressource binaire (.ts, .aac, etc.)
   const finalCt = (ct && !ct.includes('octet-stream')) ? ct : (CT_MAP[extRaw] || 'application/octet-stream');
   res.writeHead(200, { ...corsHeaders, 'Content-Type': finalCt });
-
-  const { Readable } = await import('stream');
-  Readable.fromWeb(upstream.body).pipe(res);
+  res.end(Buffer.from(buffer));
 }
